@@ -1,0 +1,14 @@
+# results/ — large binary artifacts (codes, caches)
+results/*.npy
+results/*.npz
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
