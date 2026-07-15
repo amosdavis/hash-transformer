@@ -22,6 +22,7 @@ import sys
 import time
 import json
 import gzip
+import io
 import hashlib
 import argparse
 import random
@@ -127,44 +128,74 @@ def compute_idf_from_batch(doc_ids_list, n_docs):
 # S3 streaming
 # ---------------------------------------------------------------------------
 def list_shards(fs, datasets, max_shards):
-    """List shard files across datasets, sample up to max_shards."""
+    """List shard files across datasets, sample up to max_shards.
+
+    Uses recursive glob (**/) because some datasets have nested
+    subdirectories (e.g. contrastive/refinedweb/part-00000/shard-*.jsonl.gz).
+    """
     all_shards = []
     for ds in datasets:
-        pattern = f"contrastive/{ds}/*.jsonl.gz"
-        try:
-            files = fs.glob(f"s3://{pattern}")
-            all_shards.extend(files)
-            print(f"  {ds}: {len(files)} shards", flush=True)
-        except Exception as e:
-            print(f"  {ds}: error listing — {e}", flush=True)
+        # Datasets use .jsonl (uncompressed) or .jsonl.gz (compressed)
+        for pattern in [f"contrastive/{ds}/*.jsonl",
+                        f"contrastive/{ds}/*.jsonl.gz",
+                        f"contrastive/{ds}/**/*.jsonl",
+                        f"contrastive/{ds}/**/*.jsonl.gz"]:
+            try:
+                files = fs.glob(f"s3://{pattern}")
+                if files:
+                    all_shards.extend(files)
+                    break
+            except Exception:
+                continue
+        else:
+            print(f"  {ds}: no shards found", flush=True)
+            continue
+        print(f"  {ds}: {len(all_shards)} shards so far", flush=True)
     random.shuffle(all_shards)
     return all_shards[:max_shards]
 
 
 def stream_documents(fs, shard_path):
-    """Stream documents from a single shard. Yields text strings."""
+    """Stream documents from a single shard. Yields text strings.
+
+    Handles both .jsonl (uncompressed) and .jsonl.gz (compressed).
+    """
+    is_gzip = shard_path.endswith(".gz")
     with fs.open(shard_path, "rb") as f:
-        with gzip.open(f, "rt", encoding="utf-8", errors="replace") as lines:
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    doc = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                # Different datasets use different field names
-                text = doc.get("text") or doc.get("document") or doc.get("content") or ""
-                if not text or len(text) < 20:
-                    continue
-                yield text
+        if is_gzip:
+            lines = gzip.open(f, "rt", encoding="utf-8", errors="replace")
+        else:
+            lines = io.TextIOWrapper(f, encoding="utf-8", errors="replace")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = doc.get("text") or doc.get("document") or doc.get("content") or ""
+            # Contrastive pair formats: msmarco has {query, pos}, reddit has {title, body}
+            if not text:
+                if "pos" in doc:
+                    text = doc.get("pos", "")
+                elif "title" in doc and "body" in doc:
+                    text = doc.get("title", "") + " " + doc.get("body", "")
+            if not text or len(text) < 20:
+                continue
+            yield text
 
 
 # ---------------------------------------------------------------------------
 # Training: co-occurrence bit-flip
 # ---------------------------------------------------------------------------
-def train_on_shard(table, idf_table, tokenizer, texts, epoch, density, rng):
-    """Process all documents in a shard, applying bit-flip updates.
+def train_on_shard_streaming(table, idf_table, tokenizer, fs, shard_path,
+                              epoch, density, rng):
+    """Process documents from a shard one at a time (streaming, single pass).
+
+    Builds the negative sampling distribution from a small prefix of the
+    shard, then processes the rest. This avoids materializing the entire
+    shard in memory and avoids the double-iteration problem with generators.
 
     Returns (n_docs, n_updates).
     """
@@ -172,28 +203,32 @@ def train_on_shard(table, idf_table, tokenizer, texts, epoch, density, rng):
     n_updates = 0
     V = table.shape[0]
 
-    # Negative sampling distribution from this shard's tokens
+    # Approximate negative sampling distribution: use a fixed prior based
+    # on common English token frequencies. This is good enough for
+    # contrastive push-away — we don't need per-shard precision.
+    # We build it lazily from the first 200 docs, then freeze it.
     token_freq = np.zeros(V, dtype=np.float64)
-    for text in texts:
-        enc = tokenizer.encode(text)
-        ids = sorted(set(enc.ids[:MAX_TOKENS]))
-        for t in ids:
-            token_freq[t] += 1
-        n_docs += 1
-    token_freq = token_freq ** 0.75
-    total_freq = token_freq.sum()
-    if total_freq > 0:
-        token_freq /= total_freq
+    freq_built = False
+    freq_docs_seen = 0
 
-    # Reset and re-iterate to apply updates (need token freq first)
-    # Actually, let's just process inline — token_freq from this shard
-    # is approximate but fine for negative sampling
-
-    for text in texts:
+    for text in stream_documents(fs, shard_path):
         enc = tokenizer.encode(text)
         ids = sorted(set(enc.ids[:MAX_TOKENS]))
         if len(ids) < 2:
+            n_docs += 1
             continue
+
+        # Build neg-sampling distribution from first 200 docs
+        if not freq_built:
+            for t in ids:
+                token_freq[t] += 1
+            freq_docs_seen += 1
+            if freq_docs_seen >= 200:
+                token_freq = token_freq ** 0.75
+                total_freq = token_freq.sum()
+                if total_freq > 0:
+                    token_freq /= total_freq
+                freq_built = True
 
         codes = table[ids]
         wt = idf_table[ids] if max(ids) < len(idf_table) else np.ones(len(ids), dtype=np.int8)
@@ -210,7 +245,7 @@ def train_on_shard(table, idf_table, tokenizer, texts, epoch, density, rng):
             n_updates += 1
 
         # Negative: push random non-co-occurring tokens away
-        if total_freq > 0:
+        if freq_built and total_freq > 0:
             neg_ids = rng.choice(V, size=N_NEG, p=token_freq, replace=False)
             for nt in neg_ids:
                 if nt in doc_token_set:
@@ -219,6 +254,8 @@ def train_on_shard(table, idf_table, tokenizer, texts, epoch, density, rng):
                 mask = sha_flip_mask_bits(f"neg|{epoch}|{nt}", D, density)
                 flip_mask = np.bitwise_and(agree, mask)
                 table[nt] = flip_selected_bits(table[nt], flip_mask)
+
+        n_docs += 1
 
     return n_docs, n_updates
 
@@ -286,16 +323,13 @@ def main():
 
         for si, shard_path in enumerate(shards):
             shard_t0 = time.perf_counter()
-            texts = list(stream_documents(fs, shard_path))
-            if not texts:
-                continue
-            n_docs, n_updates = train_on_shard(
-                table, idf_table, tokenizer, texts, epoch, density, rng)
+            n_docs, n_updates = train_on_shard_streaming(
+                table, idf_table, tokenizer, fs, shard_path, epoch, density, rng)
             epoch_docs += n_docs
             epoch_updates += n_updates
             total_docs += n_docs
 
-            if (si + 1) % 10 == 0:
+            if (si + 1) % 5 == 0 or si == 0:
                 elapsed = time.perf_counter() - t0
                 print(f"  epoch {epoch+1}/{args.epochs}: shard {si+1}/{len(shards)} "
                       f"({epoch_docs} docs, {epoch_updates} updates, "
