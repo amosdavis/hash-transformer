@@ -1,0 +1,24 @@
+[package]
+name = "train-s3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+rayon = "1"
+serde_json = "1"
+flate2 = "1"
+indicatif = "0.17"
+rand = "0.8"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+zip = "2"
+dirs = "5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
